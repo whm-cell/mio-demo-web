@@ -1,0 +1,12 @@
+{
+  "name": "mio-demo-web",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Zero-dependency local web chat and image generation demo for Mio (Sandbox & Dev).",
+  "scripts": {
+    "start": "node ./server.mjs --with-sandbox",
+    "start:proxy": "node ./server.mjs",
+    "test": "node --test ./tests/demo-e2e.test.mjs"
+  }
+}

@@ -1,0 +1,239 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Mio 对话与 AI 生图工作台</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <div class="app-shell">
+      <aside class="sidebar" aria-label="控制台侧栏">
+        <header class="brand-header">
+          <div class="brand-mark" aria-hidden="true">M</div>
+          <div>
+            <h1 class="brand-title">Mio Demo</h1>
+            <p class="brand-subtitle">多轮对话 · 视觉理解 · 图片生成</p>
+          </div>
+        </header>
+
+        <!-- Backend Switcher -->
+        <section class="panel" aria-labelledby="panel-backend-title">
+          <div class="panel-head">
+            <h2 id="panel-backend-title" class="panel-title">运行环境</h2>
+            <button id="refreshHealthBtn" class="btn-icon" type="button" title="刷新健康检查">↻</button>
+          </div>
+          <div class="segmented" role="group" aria-label="后端目标切换">
+            <button id="modeSandboxBtn" class="seg-btn" type="button" data-mode="sandbox">
+              Mio Sandbox 零扣费模拟
+            </button>
+            <button id="modeDevBtn" class="seg-btn" type="button" data-mode="dev">
+              Mio Dev 常驻环境
+            </button>
+          </div>
+          <div class="health-row">
+            <span id="healthDot" class="dot dot-muted" aria-hidden="true"></span>
+            <span id="healthText" class="muted small">正在探测 /readyz ...</span>
+          </div>
+          <p id="upstreamOriginText" class="mono muted tiny"></p>
+        </section>
+
+        <!-- Auth Card -->
+        <section class="panel" aria-labelledby="panel-auth-title">
+          <div class="panel-head">
+            <h2 id="panel-auth-title" class="panel-title">账号会话</h2>
+            <span id="authBadge" class="pill pill-muted">未登录</span>
+          </div>
+
+          <div id="authSignedInBox" class="stack hidden">
+            <div class="kv-line">
+              <span class="muted small">用户</span>
+              <span id="authUserLabel" class="mono small truncate"></span>
+            </div>
+            <div class="kv-line">
+              <span class="muted small">会话</span>
+              <span id="authSessionLabel" class="mono tiny truncate"></span>
+            </div>
+            <button id="signOutBtn" class="btn btn-secondary btn-full" type="button">退出登录</button>
+          </div>
+
+          <div id="authSignedOutBox" class="stack">
+            <button id="sandboxQuickLoginBtn" class="btn btn-accent btn-full hidden" type="button">
+              一键登录沙盒测试账号
+            </button>
+
+            <div class="auth-tabs" role="tablist">
+              <button id="tabSignInBtn" class="tab-btn active" type="button" role="tab" aria-selected="true">
+                邮箱登录
+              </button>
+              <button id="tabSignUpBtn" class="tab-btn" type="button" role="tab" aria-selected="false">
+                注册账号
+              </button>
+            </div>
+
+            <form id="authForm" class="stack" novalidate>
+              <label id="authNameField" class="field hidden">
+                <span class="field-label">昵称</span>
+                <input id="authNameInput" type="text" autocomplete="name" placeholder="例如：Mio 用户" />
+              </label>
+              <label class="field">
+                <span class="field-label">邮箱</span>
+                <input id="authEmailInput" type="email" autocomplete="email" placeholder="name@example.com" required />
+              </label>
+              <label class="field">
+                <span class="field-label">密码（至少 12 位）</span>
+                <input
+                  id="authPasswordInput"
+                  type="password"
+                  autocomplete="current-password"
+                  placeholder="输入登录密码"
+                  required
+                />
+              </label>
+              <button id="authSubmitBtn" class="btn btn-primary btn-full" type="submit">登录</button>
+            </form>
+          </div>
+          <p id="authErrorText" class="error-text hidden" role="alert"></p>
+        </section>
+
+        <!-- Model & Provider Card -->
+        <section class="panel" aria-labelledby="panel-models-title">
+          <div class="panel-head">
+            <h2 id="panel-models-title" class="panel-title">模型与万联配置</h2>
+            <button id="openProviderModalBtn" class="btn-link small" type="button">配置 / 测试 Key</button>
+          </div>
+
+          <div id="providerEmptyHint" class="muted small">登录后加载当前用户的动态模型目录。</div>
+
+          <div id="providerLoadedBox" class="stack hidden">
+            <label class="field">
+              <span class="field-label">对话模型（Chat）</span>
+              <select id="chatModelSelect"></select>
+            </label>
+            <div id="chatModelBadges" class="badge-row"></div>
+
+            <div class="subblock">
+              <div class="subblock-head">
+                <span class="field-label">可用生图模型（Image）</span>
+                <span id="imageModelsCount" class="mono tiny muted">0</span>
+              </div>
+              <ul id="imageModelsList" class="mini-list"></ul>
+            </div>
+          </div>
+        </section>
+
+        <!-- Conversation List -->
+        <section class="panel panel-grow" aria-labelledby="panel-conv-title">
+          <div class="panel-head">
+            <h2 id="panel-conv-title" class="panel-title">会话列表</h2>
+            <button id="newConversationBtn" class="btn btn-primary btn-xs" type="button">+ 新建会话</button>
+          </div>
+          <ul id="conversationList" class="conv-list"></ul>
+          <p id="conversationEmptyText" class="muted small">暂无会话，点击「+ 新建会话」开始。</p>
+        </section>
+      </aside>
+
+      <main class="workspace" aria-label="对话工作区">
+        <header class="workspace-header">
+          <div class="workspace-meta">
+            <div class="workspace-title-row">
+              <h2 id="activeConvTitle" class="workspace-title">请选择或新建会话</h2>
+              <span id="activeModelBadge" class="pill pill-muted hidden"></span>
+              <span id="activeVisionBadge" class="pill pill-accent hidden">支持视觉看图</span>
+            </div>
+            <p id="activeConvSubtitle" class="mono tiny muted"></p>
+          </div>
+          <div class="workspace-actions">
+            <span id="sseStatusBadge" class="pill pill-muted">未连接实时流</span>
+            <button id="cancelTurnBtn" class="btn btn-danger btn-sm hidden" type="button">停止生成</button>
+          </div>
+        </header>
+
+        <div id="globalNotice" class="notice hidden" role="status"></div>
+
+        <section id="timeline" class="timeline" aria-live="polite" aria-label="消息与工具时间线">
+          <div id="timelineWelcome" class="empty-state">
+            <h3>Mio 多轮对话 + AI 生图 Demo</h3>
+            <p>
+              支持同源代理认证、实时 SSE 文本与生图工具卡片流、3 步资产上传、图像自动轮询与原图引用二次生图。
+            </p>
+            <ol class="guide-steps">
+              <li>在左侧选择 <strong>Mio Sandbox 零扣费模拟</strong>（或切换 <strong>Mio Dev</strong>）并登录。</li>
+              <li>点击 <strong>+ 新建会话</strong>，或直接选择预设提示词发送消息。</li>
+              <li>第 1 轮生图完成后，可点击卡片上的 <strong>「带此图追问 / 二次生图」</strong> 或预设第 2 轮指令。</li>
+            </ol>
+          </div>
+        </section>
+
+        <footer class="composer-shell">
+          <div class="preset-bar" aria-label="快捷演示预设">
+            <span class="muted tiny">快捷演示：</span>
+            <button id="presetTurn1Btn" class="chip" type="button">
+              第 1 轮：文生图（Seedream 4.0）
+            </button>
+            <button id="presetTurn2Btn" class="chip" type="button">
+              第 2 轮：附图看图 + 对账 + 引用生成暖色变体（Seedream 4.5）
+            </button>
+            <button id="presetChatBtn" class="chip" type="button">普通对话问候</button>
+          </div>
+
+          <div id="attachmentBar" class="attachment-bar hidden" aria-label="待发送图片附件"></div>
+          <p id="visionWarningBanner" class="warning-text hidden" role="alert"></p>
+
+          <form id="composerForm" class="composer-form">
+            <div class="composer-controls">
+              <label class="upload-btn" title="上传本地 PNG / JPEG / WebP 图片（≤10 MiB）">
+                <input id="imageFileInput" type="file" accept="image/png,image/jpeg,image/webp" multiple hidden />
+                <span>+ 上传参考图</span>
+              </label>
+              <span id="uploadProgressText" class="muted tiny hidden"></span>
+            </div>
+            <div class="composer-input-row">
+              <textarea
+                id="composerInput"
+                rows="3"
+                placeholder="输入消息，Enter 发送，Shift+Enter 换行..."
+              ></textarea>
+              <button id="sendMessageBtn" class="btn btn-primary send-btn" type="submit">发送</button>
+            </div>
+          </form>
+        </footer>
+      </main>
+    </div>
+
+    <!-- OneLink Provider Modal -->
+    <dialog id="providerModal" class="modal" aria-labelledby="providerModalTitle">
+      <div class="modal-card">
+        <div class="modal-head">
+          <h3 id="providerModalTitle">OneLink 供应商配置与目录发现</h3>
+          <button id="closeProviderModalBtn" class="btn-icon" type="button" aria-label="关闭">✕</button>
+        </div>
+        <div class="modal-body stack">
+          <div id="providerStatusSummary" class="kv-box"></div>
+
+          <form id="providerKeyForm" class="stack">
+            <label class="field">
+              <span class="field-label">OneLink API Key（仅提交保存，不回显明文）</span>
+              <input
+                id="providerApiKeyInput"
+                type="password"
+                autocomplete="off"
+                placeholder="输入 sk-... 密钥"
+                required
+              />
+            </label>
+            <div class="row-actions">
+              <button id="saveProviderKeyBtn" class="btn btn-primary" type="submit">保存 Key</button>
+              <button id="testProviderCatalogBtn" class="btn btn-secondary" type="button">
+                测试并发现目录
+              </button>
+            </div>
+          </form>
+          <p id="providerModalFeedback" class="small hidden" role="status"></p>
+        </div>
+      </div>
+    </dialog>
+
+    <script type="module" src="/app.js"></script>
+  </body>
+</html>
