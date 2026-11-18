@@ -335,13 +335,7 @@ async function resolveAssetCached(assetId, forceRefresh = false) {
 }
 
 function ensureJobAssetsResolved(job) {
-  const ids = new Set(Array.isArray(job?.assetIds) ? job.assetIds : []);
-  if (Array.isArray(job?.outputs)) {
-    for (const out of job.outputs) {
-      if (out?.assetId) ids.add(out.assetId);
-    }
-  }
-  for (const id of ids) {
+  for (const id of extractJobAssetIds(job)) {
     const cached = state.assetCache.get(id);
     if (!cached || cached.asset?.status !== 'ready' || Date.now() >= cached.expiresAt) {
       void resolveAssetCached(id).then((asset) => {

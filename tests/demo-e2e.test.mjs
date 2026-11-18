@@ -5,7 +5,7 @@ import { existsSync, readFileSync } from 'node:fs';
 import http from 'node:http';
 import { createRequire } from 'node:module';
 import { dirname, join, resolve } from 'node:path';
-import test from 'node:test';
+import test, { describe } from 'node:test';
 import { setTimeout as delay } from 'node:timers/promises';
 import { fileURLToPath } from 'node:url';
 import { validateUploadTarget } from '../server.mjs';
@@ -574,4 +574,587 @@ test('server.mjs --with-sandbox full E2E flow and clean schema teardown', { time
     sse?.close();
     await stopChild();
   }
+});
+
+function createMockDomEnv() {
+  const byId = new Map();
+
+  class MockElement {
+    constructor(tagName, id = null) {
+      this.tagName = String(tagName).toUpperCase();
+      this.nodeType = this.tagName === '#DOCUMENT-FRAGMENT' ? 11 : 1;
+      this.id = id;
+      this._classSet = new Set();
+      this._className = '';
+      this.textContent = '';
+      this.value = '';
+      this.disabled = false;
+      this.type = '';
+      this.href = '';
+      this.target = '';
+      this.rel = '';
+      this.title = '';
+      this.src = '';
+      this.alt = '';
+      this.dataset = {};
+      this.style = {};
+      this.attributes = new Map();
+      this.listeners = new Map();
+      this.children = [];
+      this.scrollHeight = 0;
+      this.scrollTop = 0;
+      this.clientHeight = 400;
+      this.focused = false;
+      this.classList = {
+        add: (...names) => {
+          for (const n of names) {
+            if (n) this._classSet.add(n);
+          }
+          this._className = [...this._classSet].join(' ');
+        },
+        remove: (...names) => {
+          for (const n of names) {
+            this._classSet.delete(n);
+          }
+          this._className = [...this._classSet].join(' ');
+        },
+        toggle: (name, force) => {
+          const shouldAdd = force === undefined ? !this._classSet.has(name) : Boolean(force);
+          if (shouldAdd) this._classSet.add(name);
+          else this._classSet.delete(name);
+          this._className = [...this._classSet].join(' ');
+          return shouldAdd;
+        },
+        contains: (name) => this._classSet.has(name),
+      };
+    }
+
+    get className() {
+      return this._className;
+    }
+
+    set className(val) {
+      this._className = String(val || '');
+      this._classSet = new Set(this._className.split(/\s+/).filter(Boolean));
+    }
+
+    setAttribute(k, v) {
+      this.attributes.set(k, String(v));
+    }
+
+    addEventListener(type, handler) {
+      if (!this.listeners.has(type)) this.listeners.set(type, []);
+      this.listeners.get(type).push(handler);
+    }
+
+    async click() {
+      const handlers = this.listeners.get('click') || [];
+      for (const h of handlers) {
+        await h({ type: 'click', target: this });
+      }
+    }
+
+    focus() {
+      this.focused = true;
+    }
+
+    append(...nodes) {
+      for (const n of nodes) {
+        if (!n) continue;
+        if (n.nodeType === 11) {
+          this.children.push(...n.children);
+          n.children = [];
+        } else {
+          this.children.push(n);
+        }
+      }
+    }
+
+    replaceChildren(...nodes) {
+      this.children = [];
+      this.append(...nodes);
+    }
+  }
+
+  function findAll(root, predicate, out = []) {
+    if (!root) return out;
+    if (predicate(root)) out.push(root);
+    for (const child of root.children || []) {
+      findAll(child, predicate, out);
+    }
+    return out;
+  }
+
+  function collectText(node) {
+    if (!node) return '';
+    const parts = [];
+    if (node.textContent) parts.push(node.textContent);
+    for (const child of node.children || []) {
+      const t = collectText(child);
+      if (t) parts.push(t);
+    }
+    return parts.join(' ');
+  }
+
+  const documentMock = {
+    getElementById(id) {
+      if (!byId.has(id)) {
+        byId.set(id, new MockElement('div', id));
+      }
+      return byId.get(id);
+    },
+    createElement(tag) {
+      return new MockElement(tag);
+    },
+    createDocumentFragment() {
+      return new MockElement('#DOCUMENT-FRAGMENT');
+    },
+  };
+
+  class MockEventSource {
+    static CLOSED = 2;
+    static instances = [];
+
+    constructor(url) {
+      this.url = url;
+      this.readyState = 1;
+      this.closed = false;
+      this.listeners = new Map();
+      this.onopen = null;
+      this.onerror = null;
+      MockEventSource.instances.push(this);
+    }
+
+    addEventListener(type, fn) {
+      if (!this.listeners.has(type)) this.listeners.set(type, []);
+      this.listeners.get(type).push(fn);
+    }
+
+    emit(type, payload) {
+      const handlers = this.listeners.get(type) || [];
+      const ev = { type, data: typeof payload === 'string' ? payload : JSON.stringify(payload) };
+      for (const fn of handlers) fn(ev);
+    }
+
+    close() {
+      this.closed = true;
+      this.readyState = MockEventSource.CLOSED;
+    }
+  }
+
+  return { documentMock, MockEventSource, findAll, collectText };
+}
+
+describe('public/app.js tool card deduplication and follow-up helpers', () => {
+  let app = null;
+  let env = null;
+  let realFetch = null;
+  let prevGlobals = null;
+
+  const ASSET_1 = '11111111-1111-4111-8111-111111111111';
+  const ASSET_2 = '22222222-2222-4222-8222-222222222222';
+  const ASSET_RECOVERED = '33333333-3333-4333-8333-333333333333';
+
+  function resetAppForTest() {
+    app.closeConversationResources();
+    app.clearAttachmentsAndAssetCache();
+    app.state.me = { userId: 'user-1', sessionId: 'sess-1' };
+    app.state.activeConversationId = 'conv-1';
+    app.state.conversations = [
+      { id: 'conv-1', modelRef: 'onelink:qwen3.5-plus', createdAt: new Date().toISOString() },
+    ];
+    app.state.models = [
+      {
+        modelRef: 'onelink:qwen3.5-plus',
+        modelId: 'qwen3.5-plus',
+        runnable: true,
+        adaptation: { metadata: { inputModalities: ['text', 'image'] } },
+      },
+    ];
+    app.state.selectedChatModelRef = 'onelink:qwen3.5-plus';
+    app.el.composerInput.value = '';
+    app.el.timeline.replaceChildren();
+    env.MockEventSource.instances = [];
+
+    for (const id of [ASSET_1, ASSET_2, ASSET_RECOVERED]) {
+      app.state.assetCache.set(id, {
+        asset: {
+          assetId: id,
+          status: 'ready',
+          filename: `${id.slice(0, 8)}.png`,
+          downloadUrl: `https://example.test/assets/${id}.png`,
+        },
+        fetchedAt: Date.now(),
+        expiresAt: Date.now() + 120_000,
+      });
+    }
+  }
+
+  test.before(async () => {
+    env = createMockDomEnv();
+    realFetch = globalThis.fetch;
+    prevGlobals = {
+      document: globalThis.document,
+      window: globalThis.window,
+      EventSource: globalThis.EventSource,
+      skipBoot: globalThis.__MIO_DEMO_SKIP_BOOT__,
+    };
+    globalThis.__MIO_DEMO_SKIP_BOOT__ = true;
+    globalThis.document = env.documentMock;
+    globalThis.window = { location: { origin: 'http://127.0.0.1:4320' } };
+    globalThis.EventSource = env.MockEventSource;
+    app = await import('../public/app.js');
+  });
+
+  test.after(() => {
+    app?.closeConversationResources();
+    globalThis.fetch = realFetch;
+    if (prevGlobals.document === undefined) delete globalThis.document;
+    else globalThis.document = prevGlobals.document;
+    if (prevGlobals.window === undefined) delete globalThis.window;
+    else globalThis.window = prevGlobals.window;
+    if (prevGlobals.EventSource === undefined) delete globalThis.EventSource;
+    else globalThis.EventSource = prevGlobals.EventSource;
+    if (prevGlobals.skipBoot === undefined) delete globalThis.__MIO_DEMO_SKIP_BOOT__;
+    else globalThis.__MIO_DEMO_SKIP_BOOT__ = prevGlobals.skipBoot;
+  });
+
+  test('same-turn SSE tool events with same jobId merge in-place into 1 card', () => {
+    resetAppForTest();
+    globalThis.fetch = async () => new Response('{}', { status: 200 });
+    try {
+      app.connectConversationSse('conv-1');
+      const es = env.MockEventSource.instances.at(-1);
+      assert.ok(es, 'MockEventSource should be created');
+
+      es.emit('tool', {
+        requestId: 'req-sse-1',
+        tool: 'submit_image_job',
+        job: { jobId: 'job-sse-1', status: 'accepted', requestedCount: 1 },
+      });
+
+      let cards = env.findAll(app.el.timeline, (n) => n.classList?.contains('tool-card'));
+      assert.equal(cards.length, 1);
+      assert.equal(cards[0].dataset.jobId, 'job-sse-1');
+      assert.match(env.collectText(cards[0]), /提交生图任务/);
+      assert.match(env.collectText(cards[0]), /已受理 \(accepted\)/);
+
+      // Second distinct job arrives before get_image_job updates job-sse-1
+      es.emit('tool', {
+        requestId: 'req-sse-1',
+        tool: 'submit_image_job',
+        job: { jobId: 'job-sse-2', status: 'submitted', requestedCount: 1 },
+      });
+
+      // Same-turn get_image_job updates job-sse-1 in-place at index 0
+      es.emit('tool', {
+        requestId: 'req-sse-1',
+        tool: 'get_image_job',
+        job: {
+          jobId: 'job-sse-1',
+          status: 'completed',
+          requestedCount: 1,
+          assetIds: [ASSET_1],
+          outputs: [{ assetId: ASSET_1 }],
+        },
+      });
+
+      assert.equal(app.state.activeTurn.liveTools.length, 2);
+      assert.equal(app.state.activeTurn.liveTools[0].job.jobId, 'job-sse-1');
+      assert.equal(app.state.activeTurn.liveTools[0].tool, 'submit_image_job');
+      assert.equal(app.state.activeTurn.liveTools[1].job.jobId, 'job-sse-2');
+
+      cards = env.findAll(app.el.timeline, (n) => n.classList?.contains('tool-card'));
+      assert.equal(cards.length, 2, 'Should render exactly 1 card per unique jobId');
+      assert.equal(cards[0].dataset.jobId, 'job-sse-1');
+      assert.equal(cards[1].dataset.jobId, 'job-sse-2');
+      const card1Text = env.collectText(cards[0]);
+      assert.match(card1Text, /提交生图任务/);
+      assert.match(card1Text, /已完成 \(completed\)/);
+      assert.doesNotMatch(card1Text, /自动轮询进度中/);
+      assert.match(card1Text, new RegExp(ASSET_1));
+
+      // Also verify same-turn SSE submit_image_job -> get_image_job rejected leaves 1 red card
+      es.emit('tool', {
+        requestId: 'req-sse-1',
+        tool: 'get_image_job',
+        job: { jobId: 'job-sse-2', status: 'rejected', errorCode: 'SAFETY_BLOCK' },
+      });
+      cards = env.findAll(app.el.timeline, (n) => n.classList?.contains('tool-card'));
+      assert.equal(cards.length, 2);
+      const card2Text = env.collectText(cards[1]);
+      assert.match(card2Text, /提交生图任务/);
+      assert.match(card2Text, /已拒绝 \(rejected\)/);
+      assert.match(card2Text, /错误码: SAFETY_BLOCK/);
+    } finally {
+      app.closeConversationResources();
+      globalThis.fetch = realFetch;
+    }
+  });
+
+  test('historyItems merges submit_image_job and get_image_job for same jobId (completed & rejected)', () => {
+    resetAppForTest();
+    globalThis.fetch = async () => new Response('{}', { status: 200 });
+    try {
+      app.state.historyItems = [
+        { seq: 1, role: 'user', text: 'draw 1' },
+        {
+          seq: 2,
+          role: 'tool',
+          tool: 'submit_image_job',
+          job: { jobId: 'job-hist-ok', status: 'accepted', requestedCount: 1 },
+        },
+        {
+          seq: 3,
+          role: 'tool',
+          tool: 'get_image_job',
+          job: {
+            jobId: 'job-hist-ok',
+            status: 'completed',
+            requestedCount: 1,
+            assetIds: [ASSET_1],
+            outputs: [{ assetId: ASSET_1 }],
+          },
+        },
+        { seq: 4, role: 'assistant', text: 'done 1' },
+        { seq: 5, role: 'user', text: 'draw 2' },
+        {
+          seq: 6,
+          role: 'tool',
+          tool: 'submit_image_job',
+          job: { jobId: 'job-hist-rej', status: 'accepted', requestedCount: 1 },
+        },
+        {
+          seq: 7,
+          role: 'tool',
+          tool: 'get_image_job',
+          job: {
+            jobId: 'job-hist-rej',
+            status: 'rejected',
+            requestedCount: 1,
+            errorCode: 'POLICY_VIOLATION',
+          },
+        },
+        { seq: 8, role: 'assistant', text: 'failed 2' },
+      ];
+
+      app.renderTimeline();
+
+      const cards = env.findAll(app.el.timeline, (n) => n.classList?.contains('tool-card'));
+      assert.equal(cards.length, 2, 'Expected 1 merged card for each distinct jobId');
+
+      assert.equal(cards[0].dataset.jobId, 'job-hist-ok');
+      const okText = env.collectText(cards[0]);
+      assert.match(okText, /提交生图任务/);
+      assert.match(okText, /已完成 \(completed\)/);
+      assert.match(okText, new RegExp(ASSET_1));
+
+      assert.equal(cards[1].dataset.jobId, 'job-hist-rej');
+      const rejText = env.collectText(cards[1]);
+      assert.match(rejText, /提交生图任务/);
+      assert.match(rejText, /已拒绝 \(rejected\)/);
+      assert.match(rejText, /错误码: POLICY_VIOLATION/);
+
+      // Order in timeline: user(1), tool(job-hist-ok), assistant(1), user(2), tool(job-hist-rej), assistant(2)
+      assert.equal(app.el.timeline.children.length, 6);
+      assert.ok(app.el.timeline.children[1].children.some((c) => c.dataset?.jobId === 'job-hist-ok'));
+      assert.ok(app.el.timeline.children[4].children.some((c) => c.dataset?.jobId === 'job-hist-rej'));
+    } finally {
+      app.closeConversationResources();
+      globalThis.fetch = realFetch;
+    }
+  });
+
+  test('cross-turn historyItems + activeTurn.liveTools deduplicate by jobId and follow-up helpers work', async () => {
+    resetAppForTest();
+    globalThis.fetch = async (url, init) => {
+      if (String(url).endsWith('/api/v1/compute/images/job-mat-fail/recover') && init?.method === 'POST') {
+        return new Response(
+          JSON.stringify({
+            jobId: 'job-mat-fail',
+            status: 'completed',
+            requestedCount: 1,
+            assetIds: [ASSET_RECOVERED],
+            outputs: [{ assetId: ASSET_RECOVERED }],
+          }),
+          { status: 200, headers: { 'content-type': 'application/json' } },
+        );
+      }
+      return new Response('{}', { status: 200 });
+    };
+
+    try {
+      app.state.historyItems = [
+        { seq: 1, role: 'user', text: 'turn 1' },
+        {
+          seq: 2,
+          role: 'tool',
+          tool: 'submit_image_job',
+          job: { jobId: 'job-turn1', status: 'accepted', requestedCount: 1 },
+        },
+        { seq: 3, role: 'assistant', text: 'turn 1 done' },
+        { seq: 4, role: 'user', text: 'turn 2' },
+        {
+          seq: 5,
+          role: 'tool',
+          tool: 'submit_image_job',
+          job: { jobId: 'job-turn2', status: 'completed', assetIds: [ASSET_2], outputs: [{ assetId: ASSET_2 }] },
+        },
+      ];
+      app.state.jobs.set('job-turn1', {
+        jobId: 'job-turn1',
+        status: 'completed',
+        requestedCount: 1,
+        assetIds: [ASSET_1],
+        outputs: [{ assetId: ASSET_1 }],
+      });
+      app.state.activeTurn = {
+        requestId: 'req-turn3',
+        status: 'processing',
+        pendingUserText: 'turn 3',
+        pendingUserImageAssetIds: [],
+        streamText: '',
+        liveTools: [
+          {
+            tool: 'get_image_job',
+            job: {
+              jobId: 'job-turn1',
+              status: 'completed',
+              assetIds: [ASSET_1],
+              outputs: [{ assetId: ASSET_1 }],
+            },
+          },
+          {
+            tool: 'submit_image_job',
+            job: {
+              jobId: 'job-mat-fail',
+              status: 'accepted',
+              requestedCount: 1,
+            },
+          },
+          {
+            tool: 'get_image_job',
+            job: {
+              jobId: 'job-mat-fail',
+              status: 'materialization_failed',
+              errorCode: 'MAT_TIMEOUT',
+            },
+          },
+        ],
+      };
+
+      app.renderTimeline();
+
+      let cards = env.findAll(app.el.timeline, (n) => n.classList?.contains('tool-card'));
+      assert.equal(cards.length, 3, 'job-turn1 must not duplicate across historyItems and liveTools');
+      assert.deepEqual(
+        cards.map((c) => c.dataset.jobId),
+        ['job-turn1', 'job-turn2', 'job-mat-fail'],
+      );
+
+      // findLatestCompletedImageInConversation should pick job-turn2 (newest created completed job),
+      // even though Turn 3 called get_image_job on older job-turn1.
+      const latest = app.findLatestCompletedImageInConversation();
+      assert.deepEqual(latest, { jobId: 'job-turn2', assetId: ASSET_2 });
+
+      // buildFollowUpPrompt must target doubao-seedream-4.5 without output_format
+      const visionPrompt = app.buildFollowUpPrompt(latest.jobId, latest.assetId, true);
+      const nonVisionPrompt = app.buildFollowUpPrompt(latest.jobId, latest.assetId, false);
+      assert.match(visionPrompt, /doubao-seedream-4\.5/);
+      assert.match(nonVisionPrompt, /doubao-seedream-4\.5/);
+      assert.doesNotMatch(visionPrompt, /output_format/i);
+      assert.doesNotMatch(nonVisionPrompt, /output_format/i);
+
+      // Follow-up button on job-turn2 card attaches ASSET_2 and fills prompt
+      const card2Buttons = env.findAll(cards[1], (n) => n.tagName === 'BUTTON');
+      const followUpBtn = card2Buttons.find((b) => b.textContent.includes('带此图追问'));
+      assert.ok(followUpBtn, 'Completed card should expose follow-up button');
+      await followUpBtn.click();
+      assert.equal(app.state.attachments.length, 1);
+      assert.equal(app.state.attachments[0].assetId, ASSET_2);
+      assert.match(app.el.composerInput.value, new RegExp(ASSET_2));
+      assert.doesNotMatch(app.el.composerInput.value, /output_format/i);
+
+      // Recovery button on merged materialization_failed card updates card in-place and clears errorCode
+      const card3Buttons = env.findAll(cards[2], (n) => n.tagName === 'BUTTON');
+      const recoverBtn = card3Buttons.find((b) => b.textContent === '重试物化恢复');
+      assert.ok(recoverBtn, 'materialization_failed card should expose recover button');
+      await recoverBtn.click();
+
+      cards = env.findAll(app.el.timeline, (n) => n.classList?.contains('tool-card'));
+      assert.equal(cards.length, 3);
+      const recoveredText = env.collectText(cards[2]);
+      assert.match(recoveredText, /已完成 \(completed\)/);
+      assert.doesNotMatch(recoveredText, /MAT_TIMEOUT/);
+      assert.match(recoveredText, new RegExp(ASSET_RECOVERED));
+
+      // Cross-boundary merge without pre-populated state.jobs: historyItems(accepted) + liveTools(completed)
+      resetAppForTest();
+      app.state.historyItems = [
+        { seq: 1, role: 'user', text: 'turn 1' },
+        {
+          seq: 2,
+          role: 'tool',
+          tool: 'submit_image_job',
+          job: { jobId: 'job-boundary', status: 'accepted', requestedCount: 1 },
+        },
+      ];
+      app.state.activeTurn = {
+        requestId: 'req-boundary',
+        status: 'processing',
+        pendingUserText: null,
+        pendingUserImageAssetIds: null,
+        streamText: '',
+        liveTools: [
+          {
+            tool: 'get_image_job',
+            job: {
+              jobId: 'job-boundary',
+              status: 'completed',
+              assetIds: [ASSET_1],
+              outputs: [{ assetId: ASSET_1 }],
+            },
+          },
+        ],
+      };
+      app.renderTimeline();
+      cards = env.findAll(app.el.timeline, (n) => n.classList?.contains('tool-card'));
+      assert.equal(cards.length, 1);
+      assert.equal(cards[0].dataset.jobId, 'job-boundary');
+      assert.match(env.collectText(cards[0]), /提交生图任务/);
+      assert.match(env.collectText(cards[0]), /已完成 \(completed\)/);
+      assert.match(env.collectText(cards[0]), new RegExp(ASSET_1));
+
+      // Also when historyItems ends with a get_image_job re-querying an older job,
+      // findLatestCompletedImageInConversation still returns the newest created job (job-turn2).
+      resetAppForTest();
+      app.state.historyItems = [
+        {
+          seq: 1,
+          role: 'tool',
+          tool: 'submit_image_job',
+          job: { jobId: 'job-turn1', status: 'completed', assetIds: [ASSET_1], outputs: [{ assetId: ASSET_1 }] },
+        },
+        {
+          seq: 2,
+          role: 'tool',
+          tool: 'submit_image_job',
+          job: { jobId: 'job-turn2', status: 'completed', assetIds: [ASSET_2], outputs: [{ assetId: ASSET_2 }] },
+        },
+        {
+          seq: 3,
+          role: 'tool',
+          tool: 'get_image_job',
+          job: { jobId: 'job-turn1', status: 'completed', assetIds: [ASSET_1], outputs: [{ assetId: ASSET_1 }] },
+        },
+      ];
+      assert.deepEqual(app.findLatestCompletedImageInConversation(), {
+        jobId: 'job-turn2',
+        assetId: ASSET_2,
+      });
+    } finally {
+      app.closeConversationResources();
+      globalThis.fetch = realFetch;
+    }
+  });
 });
