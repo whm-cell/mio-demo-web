@@ -1,0 +1,132 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>微信授权结果 · Mio Demo</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body class="qr-complete-body">
+    <main class="qr-complete-shell" aria-live="polite">
+      <section class="qr-complete-card stack">
+        <header class="brand-header">
+          <div class="brand-mark" aria-hidden="true">M</div>
+          <div>
+            <h1 class="brand-title">Mio Demo · 微信扫码登录</h1>
+            <p class="brand-subtitle">同浏览器授权回调完成页</p>
+          </div>
+        </header>
+
+        <div class="qr-complete-status-row">
+          <span id="qrCompleteBadge" class="pill pill-success">微信授权已完成</span>
+        </div>
+
+        <h2 id="qrCompleteHeading" class="qr-complete-heading">已完成微信授权回调</h2>
+        <p id="qrCompleteDesc" class="small muted qr-complete-desc">
+          Mio 已将登录 Session Cookie 写入当前浏览器。请返回原 Mio 页面，主页面的 QR 轮询将自动确认登录并加载账号信息。
+        </p>
+
+        <div id="qrCompleteErrorBox" class="kv-box hidden" role="alert">
+          <div class="kv-line">
+            <span class="muted">回调错误码</span>
+            <span id="qrCompleteErrorCode" class="mono error-text"></span>
+          </div>
+        </div>
+
+        <div id="qrCompleteActions" class="qr-complete-actions">
+          <button id="qrCompleteCloseBtn" class="btn btn-primary btn-full" type="button">关闭此窗口</button>
+        </div>
+
+        <p id="qrCompleteFallbackTip" class="tiny muted hidden">
+          浏览器未自动关闭当前标签页，请手动关闭此窗口并返回原 Mio 页面查看登录状态。
+        </p>
+      </section>
+    </main>
+
+    <script>
+      (() => {
+        const badgeEl = document.getElementById('qrCompleteBadge');
+        const headingEl = document.getElementById('qrCompleteHeading');
+        const descEl = document.getElementById('qrCompleteDesc');
+        const errorBoxEl = document.getElementById('qrCompleteErrorBox');
+        const errorCodeEl = document.getElementById('qrCompleteErrorCode');
+        const actionsEl = document.getElementById('qrCompleteActions');
+        const closeBtnEl = document.getElementById('qrCompleteCloseBtn');
+        const fallbackTipEl = document.getElementById('qrCompleteFallbackTip');
+
+        const inIframe = (() => {
+          try {
+            return window.self !== window.top;
+          } catch {
+            return true;
+          }
+        })();
+
+        const params = new URLSearchParams(window.location.search);
+        const rawError = params.get('error');
+        const errorCode =
+          typeof rawError === 'string'
+            ? rawError.trim().replace(/[\r\n\t]+/g, ' ').slice(0, 64)
+            : '';
+
+        if (inIframe) {
+          document.body.classList.add('qr-complete-iframe');
+          closeBtnEl.classList.add('hidden');
+          actionsEl?.classList.add('hidden');
+          fallbackTipEl.classList.add('hidden');
+
+          if (errorCode) {
+            badgeEl.textContent = '微信授权未完成';
+            badgeEl.className = 'pill pill-danger';
+            headingEl.textContent = '授权未通过';
+            descEl.textContent = '请点击刷新二维码重试。';
+            errorCodeEl.textContent = errorCode;
+            errorBoxEl.classList.remove('hidden');
+          } else {
+            badgeEl.textContent = '扫码授权已完成';
+            badgeEl.className = 'pill pill-success';
+            headingEl.textContent = '扫码授权已完成，正在确认登录...';
+            descEl.textContent = '主页面正在通过 /poll 自动确认会话。';
+            errorBoxEl.classList.add('hidden');
+          }
+
+          try {
+            if (window.parent && typeof window.parent.postMessage === 'function') {
+              window.parent.postMessage(
+                { type: 'mio-wechat-qr-callback-landed', error: errorCode || null },
+                window.location.origin,
+              );
+            }
+          } catch {}
+          return;
+        }
+
+        if (errorCode) {
+          badgeEl.textContent = '微信授权未完成';
+          badgeEl.className = 'pill pill-danger';
+          headingEl.textContent = '本次微信授权未通过';
+          descEl.textContent =
+            '原 Mio 页面的 QR 轮询将更新为 failed 状态，不会建立新的登录会话。你可以关闭此窗口并返回原页面重新发起扫码。';
+          errorCodeEl.textContent = errorCode;
+          errorBoxEl.classList.remove('hidden');
+        } else {
+          badgeEl.textContent = '微信授权已完成';
+          badgeEl.className = 'pill pill-success';
+          headingEl.textContent = '已完成微信授权回调';
+          descEl.textContent =
+            'Mio 已将登录 Session Cookie 写入当前浏览器。请切换回原 Mio 页面，主页面将通过 /poll 自动确认并拉取 /api/v1/me 完成登录。';
+          errorBoxEl.classList.add('hidden');
+        }
+
+        closeBtnEl.addEventListener('click', () => {
+          window.close();
+          window.setTimeout(() => {
+            if (!window.closed) {
+              fallbackTipEl.classList.remove('hidden');
+            }
+          }, 120);
+        });
+      })();
+    </script>
+  </body>
+</html>

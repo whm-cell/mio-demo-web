@@ -69,6 +69,9 @@
               <button id="tabSignUpBtn" class="tab-btn" type="button" role="tab" aria-selected="false">
                 注册账号
               </button>
+              <button id="tabWechatQrBtn" class="tab-btn tab-btn-wechat" type="button" role="tab" aria-selected="false">
+                微信扫码
+              </button>
             </div>
 
             <form id="authForm" class="stack" novalidate>
@@ -92,7 +95,65 @@
               </label>
               <button id="authSubmitBtn" class="btn btn-primary btn-full" type="submit">登录</button>
             </form>
+
+            <div id="wechatQrPanel" class="qr-panel stack hidden" role="tabpanel" aria-label="微信扫码登录">
+              <div id="wechatQrViewport" class="qr-viewport">
+                <div id="wechatQrEmbedContainer" class="qr-embed-container"></div>
+                <div id="wechatQrLoadingOverlay" class="qr-overlay qr-overlay-loading hidden" aria-live="polite">
+                  <span class="qr-spinner" aria-hidden="true"></span>
+                  <span class="small muted">正在加载微信二维码...</span>
+                </div>
+                <button
+                  id="wechatQrRefreshBtn"
+                  class="qr-overlay qr-overlay-refresh hidden"
+                  type="button"
+                >
+                  <span class="qr-refresh-icon" aria-hidden="true">↻</span>
+                  <span id="wechatQrRefreshLabel" class="small">点击刷新二维码</span>
+                </button>
+              </div>
+
+              <div class="qr-status-box stack">
+                <div class="kv-line">
+                  <span id="wechatQrStatusBadge" class="pill pill-muted">未开始</span>
+                  <span id="wechatQrCountdown" class="mono tiny muted">300s</span>
+                </div>
+                <p id="wechatQrHintText" class="tiny muted qr-hint">请使用手机微信扫描上方二维码并确认登录。</p>
+                <div class="row-actions">
+                  <button id="wechatQrCancelBtn" class="btn btn-secondary btn-xs btn-full" type="button">
+                    停止轮询
+                  </button>
+                </div>
+              </div>
+            </div>
           </div>
+
+          <div id="wechatQrDiagBox" class="qr-diag-box stack hidden" aria-label="微信 QR Polling 诊断">
+            <div class="panel-head">
+              <span class="field-label">QR Polling 诊断</span>
+              <span id="wechatQrDiagStatusBadge" class="pill pill-muted">idle</span>
+            </div>
+            <div class="kv-line">
+              <span class="muted tiny">qrcode_id</span>
+              <span id="wechatQrDiagId" class="mono tiny truncate">-</span>
+            </div>
+            <div class="kv-line">
+              <span class="muted tiny">轮询次数</span>
+              <span id="wechatQrDiagPolls" class="mono tiny">0</span>
+            </div>
+            <div class="kv-line">
+              <span class="muted tiny">/api/v1/me userId</span>
+              <span id="wechatQrDiagUserId" class="mono tiny truncate">-</span>
+            </div>
+            <div class="subblock">
+              <span class="muted tiny">状态流转</span>
+              <div id="wechatQrDiagTrail" class="mono tiny qr-trail">-</div>
+            </div>
+            <button id="wechatQrManualPollBtn" class="btn btn-secondary btn-xs btn-full" type="button">
+              再轮询一次（验证 consumed / expired）
+            </button>
+          </div>
+
           <p id="authErrorText" class="error-text hidden" role="alert"></p>
         </section>
 

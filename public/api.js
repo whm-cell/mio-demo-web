@@ -106,6 +106,17 @@ export function signOut() {
   });
 }
 
+export function createWechatQrSession(callbackURL = '/auth/wechat/qr-complete') {
+  return requestJson('/api/auth/wechat/qr-session', {
+    method: 'POST',
+    json: { callbackURL },
+  });
+}
+
+export function pollWechatQrSession(qrcodeId) {
+  return requestJson(`/api/auth/wechat/qr-session/${encodeURIComponent(qrcodeId)}/poll`);
+}
+
 export function getOnelinkProvider() {
   return requestJson('/api/v1/providers/onelink');
 }

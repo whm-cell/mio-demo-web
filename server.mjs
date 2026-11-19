@@ -188,14 +188,95 @@ export function validateUploadTarget(rawTarget, ownPort) {
   return null;
 }
 
-function rewriteSetCookie(cookies) {
+const LOOPBACK_HOSTNAMES = new Set(['127.0.0.1', 'localhost', '[::1]', '::1']);
+const SECURE_PREFIX_COOKIE_RE = /^\s*__(?:Secure|Host)-/i;
+
+function getHeaderIgnoreCase(headers, lowerName) {
+  if (!headers || typeof headers !== 'object') return undefined;
+  if (Object.prototype.hasOwnProperty.call(headers, lowerName)) {
+    return headers[lowerName];
+  }
+  for (const [k, v] of Object.entries(headers)) {
+    if (k.toLowerCase() === lowerName) return v;
+  }
+  return undefined;
+}
+
+function getFirstHeaderToken(value) {
+  if (Array.isArray(value)) {
+    return String(value[0] ?? '').split(',')[0].trim();
+  }
+  return String(value ?? '').split(',')[0].trim();
+}
+
+export function rewriteSetCookie(cookies, { isSecureRequest = false } = {}) {
   if (!cookies) return undefined;
   const list = Array.isArray(cookies) ? cookies : [cookies];
-  return list.map((cookie) =>
-    cookie
-      .replace(/;\s*domain=[^;]*/gi, '')
-      .replace(/;\s*secure\b/gi, ''),
-  );
+  return list.map((cookie) => {
+    const withoutDomain = cookie.replace(/;\s*domain=[^;]*/gi, '');
+    if (isSecureRequest || SECURE_PREFIX_COOKIE_RE.test(withoutDomain)) {
+      return withoutDomain;
+    }
+    return withoutDomain.replace(/;\s*secure\b/gi, '');
+  });
+}
+
+export function resolveUpstreamOriginHeader(
+  reqHeaders,
+  method,
+  upstreamOrigin,
+  publicOriginEnv = process.env.MIO_PUBLIC_ORIGIN,
+) {
+  const normalizedMethod = String(method ?? 'GET').toUpperCase();
+  const rawOrigin = getHeaderIgnoreCase(reqHeaders, 'origin');
+  if (rawOrigin === undefined && (normalizedMethod === 'GET' || normalizedMethod === 'HEAD')) {
+    return undefined;
+  }
+
+  const trimmedPublic = typeof publicOriginEnv === 'string' ? publicOriginEnv.trim() : '';
+  if (trimmedPublic) {
+    return normalizeHttpOrigin(trimmedPublic);
+  }
+
+  if (typeof rawOrigin === 'string') {
+    try {
+      const parsed = new URL(rawOrigin);
+      if (
+        (parsed.protocol === 'http:' || parsed.protocol === 'https:') &&
+        (parsed.protocol === 'https:' || !LOOPBACK_HOSTNAMES.has(parsed.hostname.toLowerCase()))
+      ) {
+        return parsed.origin;
+      }
+    } catch {}
+  } else if (rawOrigin === undefined) {
+    const forwardedProto = getFirstHeaderToken(
+      getHeaderIgnoreCase(reqHeaders, 'x-forwarded-proto'),
+    ).toLowerCase();
+    if (forwardedProto === 'https') {
+      const rawHost =
+        getFirstHeaderToken(getHeaderIgnoreCase(reqHeaders, 'x-forwarded-host')) ||
+        getFirstHeaderToken(getHeaderIgnoreCase(reqHeaders, 'host'));
+      if (rawHost && !/[\s/@\\?#]/.test(rawHost)) {
+        try {
+          const parsed = new URL(`https://${rawHost}`);
+          if (
+            parsed.protocol === 'https:' &&
+            !parsed.username &&
+            !parsed.password &&
+            parsed.pathname === '/' &&
+            !parsed.search &&
+            !parsed.hash &&
+            parsed.hostname &&
+            !LOOPBACK_HOSTNAMES.has(parsed.hostname.toLowerCase())
+          ) {
+            return parsed.origin;
+          }
+        } catch {}
+      }
+    }
+  }
+
+  return upstreamOrigin;
 }
 
 async function probeReadyz(origin) {
@@ -298,7 +379,12 @@ async function serveStatic(pathname, res) {
     res.end();
     return;
   }
-  const relPath = pathname === '/' ? 'index.html' : pathname.replace(/^\/+/, '');
+  const relPath =
+    pathname === '/'
+      ? 'index.html'
+      : pathname === '/auth/wechat/qr-complete'
+        ? 'qr-complete.html'
+        : pathname.replace(/^\/+/, '');
   const fullPath = resolve(PUBLIC_DIR, relPath);
   if (fullPath !== PUBLIC_DIR && !fullPath.startsWith(PUBLIC_DIR + sep)) {
     writeApiError(res, 404, 'NOT_FOUND', 'File not found');
@@ -339,8 +425,16 @@ function forwardProxy(req, res, upstreamOrigin) {
   }
 
   const method = (req.method ?? 'GET').toUpperCase();
-  if (headers.origin !== undefined || (method !== 'GET' && method !== 'HEAD')) {
-    headers.origin = upstreamOrigin;
+  const isSecureRequest =
+    getFirstHeaderToken(req.headers['x-forwarded-proto']).toLowerCase() === 'https' ||
+    (typeof req.headers.origin === 'string' &&
+      req.headers.origin.toLowerCase().startsWith('https://'));
+
+  const resolvedOrigin = resolveUpstreamOriginHeader(req.headers, method, upstreamOrigin);
+  if (resolvedOrigin !== undefined) {
+    headers.origin = resolvedOrigin;
+  } else {
+    delete headers.origin;
   }
 
   const transport = targetUrl.protocol === 'https:' ? https : http;
@@ -366,12 +460,30 @@ function forwardProxy(req, res, upstreamOrigin) {
         const lower = key.toLowerCase();
         if (value === undefined || HOP_BY_HOP_HEADERS.has(lower)) continue;
         if (lower === 'set-cookie') {
-          const rewritten = rewriteSetCookie(value);
+          const rewritten = rewriteSetCookie(value, { isSecureRequest });
           if (rewritten?.length) respHeaders['set-cookie'] = rewritten;
           continue;
         }
         if (isSse && (lower === 'content-length' || lower === 'cache-control')) continue;
         respHeaders[lower] = value;
+      }
+
+      if (targetUrl.pathname === '/api/auth/callback/wechat') {
+        console.log(
+          JSON.stringify({
+            event: 'wechat_callback_proxy',
+            statusCode,
+            hasCookieHeader: Boolean(req.headers.cookie),
+            hasStateCookieName: /(?:^|;\s*)(?:__Secure-)?mio\.state=/.test(
+              String(req.headers.cookie ?? ''),
+            ),
+            secFetchDest: req.headers['sec-fetch-dest'] ?? null,
+            secFetchSite: req.headers['sec-fetch-site'] ?? null,
+            setSessionCookie:
+              Array.isArray(respHeaders['set-cookie']) &&
+              respHeaders['set-cookie'].some((c) => c.includes('session_token=')),
+          }),
+        );
       }
 
       if (isSse) {

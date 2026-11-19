@@ -2,6 +2,7 @@ import {
   ApiError,
   cancelConversationTurn,
   createConversation,
+  createWechatQrSession,
   getAsset,
   getConversationHistory,
   getDemoConfig,
@@ -13,6 +14,7 @@ import {
   listOnelinkModels,
   normalizeImageAssetIds,
   openConversationEvents,
+  pollWechatQrSession,
   putOnelinkCredential,
   recoverImageJob,
   sendConversationMessage,
@@ -36,6 +38,32 @@ const ALLOWED_IMAGE_TYPES = new Set(['image/png', 'image/jpeg', 'image/webp']);
 const MAX_VISION_BYTES = 10 * 1024 * 1024;
 const ASSET_CACHE_DEFAULT_TTL_MS = 240_000;
 const JOB_POLL_INTERVAL_MS = 1500;
+const WECHAT_QR_POLL_INTERVAL_MS = 1000;
+const WECHAT_QR_MAX_POLLS_PAST_EXPIRY = 10;
+const WECHAT_QR_MAX_CONSECUTIVE_401 = 5;
+const WECHAT_OPEN_ORIGIN = 'https://open.weixin.qq.com';
+const WECHAT_WXLOGIN_SCRIPT_URL =
+  'https://res.wx.qq.com/connect/zh_CN/htmledition/js/wxLogin.js';
+const WECHAT_QR_IFRAME_ORIGINAL_WIDTH = 300;
+const WECHAT_QR_IFRAME_ORIGINAL_HEIGHT = 400;
+const WECHAT_QR_DEFAULT_VIEWPORT_SIZE = 248;
+const WECHAT_QR_CALLBACK_MESSAGE_TYPE = 'mio-wechat-qr-callback-landed';
+const WECHAT_QR_WAKE_DELAY_MS = 20;
+const WECHAT_QR_CUSTOM_CSS = [
+  '.impowerBox .qrcode { margin: 0 auto; }',
+  '.impowerBox .title { display: none; }',
+  '.impowerBox .info { display: none; }',
+  '.impowerBox .status { display: none; }',
+  '.impowerBox .wrap { overflow: hidden; }',
+].join('');
+const WECHAT_QR_CUSTOM_HREF = `data:text/css;charset=utf-8,${encodeURIComponent(WECHAT_QR_CUSTOM_CSS)}`;
+const WECHAT_QR_REFRESHABLE_STATUSES = new Set([
+  'expired',
+  'failed',
+  'error',
+  'stopped',
+  'consumed',
+]);
 
 const JOB_STATUS_LABELS = {
   accepted: '已受理',
@@ -72,7 +100,33 @@ const state = {
   assetCache: new Map(),
   assetInflight: new Map(),
   attachments: [],
+  wechatQr: {
+    qrcodeId: null,
+    authorizationUrl: null,
+    expireSeconds: 300,
+    expiresAt: 0,
+    status: 'idle',
+    loading: false,
+    polling: false,
+    pollInFlight: false,
+    wakePending: false,
+    pollCount: 0,
+    consecutive401: 0,
+    recorded401InTrail: false,
+    trail: [],
+    matchedUserId: null,
+    message: '',
+    timerId: null,
+    runId: 0,
+    manualPolling: false,
+    pollIntervalMs: WECHAT_QR_POLL_INTERVAL_MS,
+  },
 };
+
+let eventsBound = false;
+let wxLoginScriptPromise = null;
+let wechatQrObserver = null;
+let wechatQrWxInstance = null;
 
 function collectDomElements() {
   if (typeof document === 'undefined') return {};
@@ -91,6 +145,24 @@ function collectDomElements() {
     authSessionLabel: document.getElementById('authSessionLabel'),
     signOutBtn: document.getElementById('signOutBtn'),
     sandboxQuickLoginBtn: document.getElementById('sandboxQuickLoginBtn'),
+    tabWechatQrBtn: document.getElementById('tabWechatQrBtn'),
+    wechatQrPanel: document.getElementById('wechatQrPanel'),
+    wechatQrViewport: document.getElementById('wechatQrViewport'),
+    wechatQrEmbedContainer: document.getElementById('wechatQrEmbedContainer'),
+    wechatQrLoadingOverlay: document.getElementById('wechatQrLoadingOverlay'),
+    wechatQrRefreshBtn: document.getElementById('wechatQrRefreshBtn'),
+    wechatQrRefreshLabel: document.getElementById('wechatQrRefreshLabel'),
+    wechatQrStatusBadge: document.getElementById('wechatQrStatusBadge'),
+    wechatQrCountdown: document.getElementById('wechatQrCountdown'),
+    wechatQrHintText: document.getElementById('wechatQrHintText'),
+    wechatQrCancelBtn: document.getElementById('wechatQrCancelBtn'),
+    wechatQrDiagBox: document.getElementById('wechatQrDiagBox'),
+    wechatQrDiagStatusBadge: document.getElementById('wechatQrDiagStatusBadge'),
+    wechatQrDiagId: document.getElementById('wechatQrDiagId'),
+    wechatQrDiagPolls: document.getElementById('wechatQrDiagPolls'),
+    wechatQrDiagUserId: document.getElementById('wechatQrDiagUserId'),
+    wechatQrDiagTrail: document.getElementById('wechatQrDiagTrail'),
+    wechatQrManualPollBtn: document.getElementById('wechatQrManualPollBtn'),
     tabSignInBtn: document.getElementById('tabSignInBtn'),
     tabSignUpBtn: document.getElementById('tabSignUpBtn'),
     authForm: document.getElementById('authForm'),
@@ -159,6 +231,12 @@ function safeHref(rawUrl) {
     return null;
   }
   return null;
+}
+
+function safeHttpHref(rawUrl) {
+  const href = safeHref(rawUrl);
+  if (!href) return null;
+  return href.startsWith('https://') || href.startsWith('http://') ? href : null;
 }
 
 function makeRequestId() {
@@ -416,6 +494,693 @@ function renderConfig() {
   el.sandboxQuickLoginBtn.classList.toggle('hidden', !showQuickSandbox);
 }
 
+function parseWechatAuthorizationUrl(rawUrl) {
+  if (typeof rawUrl !== 'string' || !rawUrl.trim()) {
+    throw new Error('微信授权链接无效');
+  }
+  let url;
+  try {
+    url = new URL(rawUrl);
+  } catch {
+    throw new Error('微信授权链接解析失败');
+  }
+  if (url.origin !== WECHAT_OPEN_ORIGIN) {
+    throw new Error(`不允许的微信授权源：${url.origin}`);
+  }
+  const appid = (url.searchParams.get('appid') || '').trim();
+  const redirect_uri = (url.searchParams.get('redirect_uri') || '').trim();
+  const stateParam = (url.searchParams.get('state') || '').trim();
+  const scope = (url.searchParams.get('scope') || '').trim() || 'snsapi_login';
+  if (!appid || !redirect_uri || !stateParam) {
+    throw new Error('微信授权链接缺少必要参数（appid / redirect_uri / state）');
+  }
+  let parsedRedirect;
+  try {
+    parsedRedirect = new URL(redirect_uri);
+  } catch {
+    throw new Error('微信授权链接的 redirect_uri 必须为绝对 HTTP(S) 地址');
+  }
+  if (parsedRedirect.protocol !== 'https:' && parsedRedirect.protocol !== 'http:') {
+    throw new Error('微信授权链接的 redirect_uri 协议无效');
+  }
+  return {
+    appid,
+    redirect_uri,
+    state: stateParam,
+    scope,
+  };
+}
+
+function getWxLoginConstructor() {
+  const ctor = (typeof window !== 'undefined' && window?.WxLogin) || globalThis.WxLogin;
+  return typeof ctor === 'function' ? ctor : null;
+}
+
+function loadWxLoginScript() {
+  const existing = getWxLoginConstructor();
+  if (existing) {
+    return Promise.resolve(existing);
+  }
+  if (wxLoginScriptPromise) {
+    return wxLoginScriptPromise;
+  }
+
+  wxLoginScriptPromise = new Promise((resolve, reject) => {
+    if (typeof document === 'undefined' || !document.head) {
+      reject(new Error('当前环境不支持加载微信官方扫码脚本'));
+      return;
+    }
+
+    const existingScript =
+      typeof document.querySelector === 'function'
+        ? document.querySelector(`script[src="${WECHAT_WXLOGIN_SCRIPT_URL}"]`)
+        : null;
+    const script = existingScript || document.createElement('script');
+
+    const cleanup = () => {
+      script.removeEventListener?.('load', onLoad);
+      script.removeEventListener?.('error', onError);
+    };
+
+    const onLoad = () => {
+      cleanup();
+      const ctor = getWxLoginConstructor();
+      if (ctor) {
+        resolve(ctor);
+      } else {
+        script.remove?.();
+        reject(new Error('微信官方脚本已加载，但未暴露 WxLogin'));
+      }
+    };
+
+    const onError = () => {
+      cleanup();
+      script.remove?.();
+      reject(new Error('微信官方脚本加载失败，请检查网络连接后重试'));
+    };
+
+    if (typeof script.addEventListener === 'function') {
+      script.addEventListener('load', onLoad);
+      script.addEventListener('error', onError);
+    } else {
+      script.onload = onLoad;
+      script.onerror = onError;
+    }
+
+    if (!existingScript) {
+      script.src = WECHAT_WXLOGIN_SCRIPT_URL;
+      script.async = true;
+      document.head.appendChild(script);
+    }
+  }).finally(() => {
+    wxLoginScriptPromise = null;
+  });
+
+  return wxLoginScriptPromise;
+}
+
+function findWechatQrIframe(container = el.wechatQrEmbedContainer) {
+  if (!container) return null;
+  if (typeof container.querySelector === 'function') {
+    const found = container.querySelector('iframe');
+    if (found) return found;
+  }
+  const stack = [...(container.children || [])];
+  while (stack.length > 0) {
+    const node = stack.shift();
+    if (node?.tagName === 'IFRAME') return node;
+    if (Array.isArray(node?.children)) {
+      stack.push(...node.children);
+    }
+  }
+  return null;
+}
+
+function fitWechatQrIframe(container = el.wechatQrEmbedContainer) {
+  const iframe = findWechatQrIframe(container);
+  if (!iframe) return false;
+
+  const containerWidth = container.offsetWidth || WECHAT_QR_DEFAULT_VIEWPORT_SIZE;
+  const containerHeight = container.offsetHeight || WECHAT_QR_DEFAULT_VIEWPORT_SIZE;
+  const scale = Math.min(
+    containerWidth / WECHAT_QR_IFRAME_ORIGINAL_WIDTH,
+    containerHeight / WECHAT_QR_IFRAME_ORIGINAL_HEIGHT,
+  );
+
+  iframe.style.width = `${WECHAT_QR_IFRAME_ORIGINAL_WIDTH}px`;
+  iframe.style.height = `${WECHAT_QR_IFRAME_ORIGINAL_HEIGHT}px`;
+  iframe.style.border = 'none';
+  iframe.style.display = 'block';
+  iframe.style.position = 'absolute';
+  iframe.style.left = '50%';
+  iframe.style.top = '50%';
+  iframe.style.transform = `translate(-50%, -50%) scale(${scale})`;
+  iframe.style.transformOrigin = 'center center';
+  return true;
+}
+
+function clearWechatQrEmbedContainer() {
+  if (wechatQrObserver) {
+    wechatQrObserver.disconnect();
+    wechatQrObserver = null;
+  }
+  wechatQrWxInstance = null;
+  el.wechatQrEmbedContainer?.replaceChildren?.();
+}
+
+function isWechatQrRefreshable() {
+  const qr = state.wechatQr;
+  if (qr.loading || qr.polling) return false;
+  if (WECHAT_QR_REFRESHABLE_STATUSES.has(qr.status)) return true;
+  return !state.me && (qr.status === 'idle' || qr.status === 'confirmed');
+}
+
+function isWechatQrSessionActive() {
+  const qr = state.wechatQr;
+  if (qr.loading) return true;
+  return Boolean(qr.polling && qr.qrcodeId && (qr.expiresAt === 0 || Date.now() < qr.expiresAt));
+}
+
+function wechatQrRefreshLabel(status) {
+  switch (status) {
+    case 'expired':
+      return '二维码已过期，点击刷新二维码';
+    case 'failed':
+      return '授权未通过，点击刷新二维码';
+    case 'error':
+      return '加载或轮询失败，点击刷新二维码';
+    case 'stopped':
+      return '轮询已停止，点击刷新二维码';
+    case 'consumed':
+      return '二维码已使用，点击刷新二维码';
+    default:
+      return '点击刷新二维码';
+  }
+}
+
+function appendWechatQrTrail(entry) {
+  if (!entry) return;
+  const trail = state.wechatQr.trail;
+  if (trail[trail.length - 1] !== entry) {
+    trail.push(entry);
+  }
+}
+
+function wechatQrStatusMeta(status) {
+  switch (status) {
+    case 'loading':
+      return { label: '加载中 (loading)', tone: 'primary' };
+    case 'pending':
+      return { label: '等待扫码 (pending)', tone: 'primary' };
+    case 'confirmed':
+      return { label: '已确认 (confirmed)', tone: 'success' };
+    case 'consumed':
+      return { label: '已消费 (consumed)', tone: 'accent' };
+    case 'failed':
+      return { label: '授权失败 (failed)', tone: 'danger' };
+    case 'expired':
+      return { label: '已过期 (expired)', tone: 'warn' };
+    case 'stopped':
+      return { label: '已停止 (stopped)', tone: 'muted' };
+    case 'error':
+      return { label: '轮询异常 (error)', tone: 'danger' };
+    default:
+      return { label: status || 'idle', tone: 'muted' };
+  }
+}
+
+function renderWechatQr() {
+  const qr = state.wechatQr;
+  const refreshable = isWechatQrRefreshable();
+
+  if (el.wechatQrLoadingOverlay) {
+    el.wechatQrLoadingOverlay.classList.toggle('hidden', !qr.loading);
+  }
+
+  if (el.wechatQrRefreshBtn) {
+    el.wechatQrRefreshBtn.classList.toggle('hidden', !refreshable);
+  }
+
+  if (el.wechatQrRefreshLabel) {
+    el.wechatQrRefreshLabel.textContent = wechatQrRefreshLabel(qr.status);
+  }
+
+  if (el.wechatQrViewport) {
+    el.wechatQrViewport.classList.toggle('qr-viewport-clickable', refreshable);
+  }
+
+  if (el.wechatQrStatusBadge) {
+    if (qr.polling && qr.consecutive401 > 0) {
+      el.wechatQrStatusBadge.textContent = `等待 Cookie 写入 (401 重试 ${qr.consecutive401}/${WECHAT_QR_MAX_CONSECUTIVE_401})`;
+      el.wechatQrStatusBadge.className = 'pill pill-warn';
+    } else {
+      const meta = wechatQrStatusMeta(qr.status);
+      el.wechatQrStatusBadge.textContent = meta.label;
+      el.wechatQrStatusBadge.className = `pill pill-${meta.tone}`;
+    }
+  }
+
+  if (el.wechatQrCountdown) {
+    if (qr.status === 'expired') {
+      el.wechatQrCountdown.textContent = '0s';
+    } else if (qr.polling && qr.expiresAt > 0) {
+      const remaining = Math.max(0, Math.ceil((qr.expiresAt - Date.now()) / 1000));
+      el.wechatQrCountdown.textContent = remaining > 0 ? `${remaining}s` : '0s (等待 expired)';
+    } else if (qr.loading) {
+      el.wechatQrCountdown.textContent = '加载中...';
+    } else {
+      el.wechatQrCountdown.textContent = `${qr.expireSeconds}s`;
+    }
+  }
+
+  if (el.wechatQrHintText) {
+    el.wechatQrHintText.textContent =
+      qr.message || '请使用手机微信扫描上方二维码并确认登录。';
+  }
+
+  if (el.wechatQrCancelBtn) {
+    const canStop = qr.loading || qr.polling;
+    el.wechatQrCancelBtn.textContent = canStop ? '停止轮询' : '刷新二维码';
+    el.wechatQrCancelBtn.className = canStop
+      ? 'btn btn-danger btn-xs btn-full'
+      : 'btn btn-secondary btn-xs btn-full';
+  }
+
+  if (el.wechatQrDiagBox) {
+    el.wechatQrDiagBox.classList.toggle('hidden', !qr.qrcodeId);
+  }
+
+  if (el.wechatQrDiagStatusBadge) {
+    const meta = wechatQrStatusMeta(qr.status);
+    el.wechatQrDiagStatusBadge.textContent = qr.status || 'idle';
+    el.wechatQrDiagStatusBadge.className = `pill pill-${meta.tone}`;
+  }
+
+  if (el.wechatQrDiagId) {
+    el.wechatQrDiagId.textContent = qr.qrcodeId || '-';
+    el.wechatQrDiagId.title = qr.qrcodeId || '';
+  }
+
+  if (el.wechatQrDiagPolls) {
+    el.wechatQrDiagPolls.textContent = String(qr.pollCount);
+  }
+
+  if (el.wechatQrDiagUserId) {
+    el.wechatQrDiagUserId.textContent = qr.matchedUserId || '-';
+    el.wechatQrDiagUserId.title = qr.matchedUserId || '';
+  }
+
+  if (el.wechatQrDiagTrail) {
+    el.wechatQrDiagTrail.textContent = qr.trail.length > 0 ? qr.trail.join(' -> ') : '-';
+  }
+
+  if (el.wechatQrManualPollBtn) {
+    el.wechatQrManualPollBtn.disabled =
+      !qr.qrcodeId || qr.loading || qr.polling || qr.manualPolling;
+  }
+}
+
+function stopWechatQrPolling(options = {}) {
+  const { resetDiag = false, status = null, message = null } = options;
+  const qr = state.wechatQr;
+  if (qr.timerId !== null) {
+    clearTimeout(qr.timerId);
+    qr.timerId = null;
+  }
+  qr.runId += 1;
+  qr.loading = false;
+  qr.polling = false;
+  qr.pollInFlight = false;
+  qr.wakePending = false;
+  qr.manualPolling = false;
+  qr.consecutive401 = 0;
+
+  clearWechatQrEmbedContainer();
+
+  if (resetDiag) {
+    qr.qrcodeId = null;
+    qr.authorizationUrl = null;
+    qr.expireSeconds = 300;
+    qr.expiresAt = 0;
+    qr.status = 'idle';
+    qr.pollCount = 0;
+    qr.recorded401InTrail = false;
+    qr.trail = [];
+    qr.matchedUserId = null;
+    qr.message = '';
+  } else {
+    if (status !== null) {
+      qr.status = status;
+    } else if (qr.status === 'loading' || qr.status === 'pending') {
+      qr.status = 'stopped';
+      if (message === null) {
+        qr.message = '微信扫码轮询已停止，点击上方二维码区域可重新加载。';
+      }
+    }
+    if (message !== null) qr.message = message;
+  }
+  renderWechatQr();
+}
+
+function scheduleWechatQrPoll(runId, overrideDelayMs = null) {
+  const qr = state.wechatQr;
+  if (!qr.polling || qr.runId !== runId || !qr.qrcodeId || qr.pollInFlight) return;
+  if (qr.timerId !== null) {
+    clearTimeout(qr.timerId);
+    qr.timerId = null;
+  }
+  const defaultDelayMs =
+    typeof qr.pollIntervalMs === 'number' && qr.pollIntervalMs >= 0
+      ? qr.pollIntervalMs
+      : WECHAT_QR_POLL_INTERVAL_MS;
+  const delayMs =
+    typeof overrideDelayMs === 'number' && overrideDelayMs >= 0
+      ? overrideDelayMs
+      : defaultDelayMs;
+  qr.timerId = setTimeout(() => {
+    void runWechatQrPollTick(runId);
+  }, delayMs);
+}
+
+function handleWechatQrWindowMessage(event) {
+  const qr = state.wechatQr;
+  if (!qr.polling || !qr.qrcodeId) return;
+
+  const expectedOrigin = typeof window !== 'undefined' ? window.location?.origin : null;
+  if (!expectedOrigin || event?.origin !== expectedOrigin) return;
+
+  const data = event?.data;
+  if (!data || typeof data !== 'object' || data.type !== WECHAT_QR_CALLBACK_MESSAGE_TYPE) {
+    return;
+  }
+
+  const iframe = findWechatQrIframe(el.wechatQrEmbedContainer);
+  if (!iframe) return;
+  const expectedSource = iframe.contentWindow ?? null;
+  if (expectedSource && event.source !== expectedSource) {
+    return;
+  }
+
+  const rawErr = data.error
+    ? String(data.error).trim().replace(/[\r\n\t]+/g, ' ').slice(0, 32)
+    : '';
+  appendWechatQrTrail(rawErr ? `iframe_cb(${rawErr})` : 'iframe_cb(ok)');
+  renderWechatQr();
+
+  if (qr.pollInFlight) {
+    qr.wakePending = true;
+    return;
+  }
+  scheduleWechatQrPoll(qr.runId, WECHAT_QR_WAKE_DELAY_MS);
+}
+
+async function runWechatQrPollTick(runId) {
+  const qr = state.wechatQr;
+  qr.timerId = null;
+  if (!qr.polling || qr.runId !== runId || !qr.qrcodeId || qr.pollInFlight) return;
+
+  const qrcodeId = qr.qrcodeId;
+  qr.pollInFlight = true;
+  try {
+    const res = await pollWechatQrSession(qrcodeId);
+    if (qr.runId === runId) qr.pollInFlight = false;
+    if (!qr.polling || qr.runId !== runId) return;
+
+    qr.pollCount += 1;
+    qr.consecutive401 = 0;
+    const pollStatus = res?.status;
+
+    if (pollStatus === 'pending') {
+      qr.status = 'pending';
+      appendWechatQrTrail('pending');
+      const maxPolls = Math.max(
+        (qr.expireSeconds || 300) + WECHAT_QR_MAX_POLLS_PAST_EXPIRY,
+        310,
+      );
+      if (qr.pollCount >= maxPolls) {
+        const msg = '自动轮询已达上限次数仍未收敛，请点击手动轮询或刷新二维码重试。';
+        stopWechatQrPolling({ status: 'stopped', message: msg });
+        if (el.authErrorText) {
+          el.authErrorText.textContent = msg;
+          el.authErrorText.classList.remove('hidden');
+        }
+        return;
+      }
+      const nextDelay = qr.wakePending ? WECHAT_QR_WAKE_DELAY_MS : null;
+      qr.wakePending = false;
+      renderWechatQr();
+      scheduleWechatQrPoll(runId, nextDelay);
+      return;
+    }
+
+    if (pollStatus === 'confirmed') {
+      appendWechatQrTrail('confirmed');
+      stopWechatQrPolling({
+        status: 'confirmed',
+        message: '微信扫码已确认，正在拉取 /api/v1/me 会话...',
+      });
+      await refreshAuthAndData();
+      if (state.wechatQr.qrcodeId === qrcodeId) {
+        if (state.me?.userId) {
+          state.wechatQr.matchedUserId = state.me.userId;
+          state.wechatQr.message = '微信扫码登录成功，已建立会话。';
+          el.authErrorText?.classList.add('hidden');
+          showNotice('微信扫码登录成功，已自动加载账号会话。', 'info');
+        } else {
+          const msg =
+            '轮询已返回 confirmed，但未能从 /api/v1/me 读取有效会话，请检查同源 Cookie 后重试。';
+          state.wechatQr.matchedUserId = null;
+          state.wechatQr.message = msg;
+          if (el.authErrorText) {
+            el.authErrorText.textContent = msg;
+            el.authErrorText.classList.remove('hidden');
+          }
+        }
+        renderWechatQr();
+      }
+      return;
+    }
+
+    if (pollStatus === 'failed' || pollStatus === 'expired' || pollStatus === 'consumed') {
+      appendWechatQrTrail(pollStatus);
+      const messageByStatus = {
+        failed: '微信授权未完成（failed），请点击刷新二维码重试。',
+        expired: '微信扫码会话已过期（expired），请点击刷新二维码重试。',
+        consumed: '该扫码结果已被消费（consumed），如需重新登录请刷新二维码。',
+      };
+      const msg = messageByStatus[pollStatus];
+      stopWechatQrPolling({ status: pollStatus, message: msg });
+      if (el.authErrorText) {
+        el.authErrorText.textContent = msg;
+        el.authErrorText.classList.remove('hidden');
+      }
+      return;
+    }
+
+    const unknownLabel = String(pollStatus || 'unknown');
+    appendWechatQrTrail(unknownLabel);
+    const unknownMsg = `微信扫码轮询返回未知状态：${unknownLabel}`;
+    stopWechatQrPolling({ status: 'error', message: unknownMsg });
+    if (el.authErrorText) {
+      el.authErrorText.textContent = unknownMsg;
+      el.authErrorText.classList.remove('hidden');
+    }
+  } catch (err) {
+    if (qr.runId === runId) qr.pollInFlight = false;
+    if (!qr.polling || qr.runId !== runId) return;
+    qr.pollCount += 1;
+
+    if (err instanceof ApiError && err.status === 401) {
+      qr.consecutive401 += 1;
+      if (!qr.recorded401InTrail) {
+        qr.recorded401InTrail = true;
+        appendWechatQrTrail('401');
+      }
+      if (qr.consecutive401 <= WECHAT_QR_MAX_CONSECUTIVE_401) {
+        qr.message = `微信可能已确认授权，正在等待当前浏览器写入 Session Cookie（401 重试 ${qr.consecutive401}/${WECHAT_QR_MAX_CONSECUTIVE_401}）...`;
+        const nextDelay = qr.wakePending ? WECHAT_QR_WAKE_DELAY_MS : null;
+        qr.wakePending = false;
+        renderWechatQr();
+        scheduleWechatQrPoll(runId, nextDelay);
+        return;
+      }
+      const msg =
+        '微信已确认该二维码（401 UNAUTHORIZED），但当前浏览器缺少匹配的 Session Cookie；请确认当前页面通过与回调域一致的 HTTPS 域名访问，且浏览器未拦截内嵌 iframe 的同源 Cookie 后重试。';
+      stopWechatQrPolling({ status: 'error', message: msg });
+      if (el.authErrorText) {
+        el.authErrorText.textContent = msg;
+        el.authErrorText.classList.remove('hidden');
+      }
+      return;
+    }
+
+    const trailCode = err instanceof ApiError ? `${err.status}(${err.code})` : 'network_error';
+    appendWechatQrTrail(trailCode);
+    const errMsg = `微信扫码轮询失败：${formatApiError(err, '未知错误')}`;
+    stopWechatQrPolling({ status: 'error', message: errMsg });
+    if (el.authErrorText) {
+      el.authErrorText.textContent = errMsg;
+      el.authErrorText.classList.remove('hidden');
+    }
+  }
+}
+
+async function startWechatQrLogin() {
+  stopWechatQrPolling();
+  el.authErrorText?.classList.add('hidden');
+
+  const qr = state.wechatQr;
+  const createRunId = ++qr.runId;
+  qr.loading = true;
+  qr.status = 'loading';
+  qr.message = '正在加载微信二维码...';
+  renderWechatQr();
+
+  try {
+    const res = await createWechatQrSession('/auth/wechat/qr-complete');
+    if (qr.runId !== createRunId || state.me) return;
+
+    const authUrl = safeHttpHref(res?.authorization_url);
+    if (!res?.qrcode_id || !authUrl) {
+      throw new Error('服务端返回的二维码会话或授权地址无效');
+    }
+
+    const wxParams = parseWechatAuthorizationUrl(authUrl);
+    const WxLoginCtor = await loadWxLoginScript();
+    if (qr.runId !== createRunId || state.me) return;
+
+    const container = el.wechatQrEmbedContainer;
+    if (!container) {
+      throw new Error('缺少微信二维码挂载容器');
+    }
+
+    clearWechatQrEmbedContainer();
+
+    wechatQrWxInstance = new WxLoginCtor({
+      self_redirect: true,
+      id: container.id || 'wechatQrEmbedContainer',
+      appid: wxParams.appid,
+      redirect_uri: wxParams.redirect_uri,
+      state: wxParams.state,
+      scope: wxParams.scope,
+      style: 'black',
+      href: WECHAT_QR_CUSTOM_HREF,
+    });
+
+    if (!fitWechatQrIframe(container) && typeof MutationObserver === 'function') {
+      const observer = new MutationObserver(() => {
+        if (qr.runId !== createRunId) {
+          observer.disconnect();
+          if (wechatQrObserver === observer) wechatQrObserver = null;
+          return;
+        }
+        if (fitWechatQrIframe(container)) {
+          observer.disconnect();
+          if (wechatQrObserver === observer) wechatQrObserver = null;
+        }
+      });
+      wechatQrObserver = observer;
+      observer.observe(container, {
+        childList: true,
+        subtree: true,
+      });
+    }
+
+    const expireSeconds =
+      typeof res.expire_seconds === 'number' && res.expire_seconds > 0
+        ? res.expire_seconds
+        : 300;
+    qr.loading = false;
+    qr.qrcodeId = res.qrcode_id;
+    qr.authorizationUrl = authUrl;
+    qr.expireSeconds = expireSeconds;
+    qr.expiresAt = Date.now() + expireSeconds * 1000;
+    qr.status = 'pending';
+    qr.polling = true;
+    qr.pollInFlight = false;
+    qr.wakePending = false;
+    qr.pollCount = 0;
+    qr.consecutive401 = 0;
+    qr.recorded401InTrail = false;
+    qr.trail = ['created(201)'];
+    qr.matchedUserId = null;
+    qr.manualPolling = false;
+    qr.message = '请使用手机微信扫描上方二维码并确认；本页每秒自动轮询状态。';
+
+    renderWechatQr();
+    scheduleWechatQrPoll(createRunId);
+  } catch (err) {
+    if (qr.runId !== createRunId) return;
+    clearWechatQrEmbedContainer();
+    qr.loading = false;
+    qr.polling = false;
+    qr.pollInFlight = false;
+    qr.wakePending = false;
+    qr.status = 'error';
+    const errMsg = formatApiError(err, '创建微信扫码会话失败');
+    qr.message = `${errMsg}，点击上方二维码区域可重试。`;
+    if (el.authErrorText) {
+      el.authErrorText.textContent = errMsg;
+      el.authErrorText.classList.remove('hidden');
+    }
+    renderWechatQr();
+  }
+}
+
+async function manualPollWechatQr() {
+  const qr = state.wechatQr;
+  if (!qr.qrcodeId || qr.loading || qr.polling || qr.manualPolling) return;
+  const targetRunId = qr.runId;
+  const targetQrcodeId = qr.qrcodeId;
+  qr.manualPolling = true;
+  renderWechatQr();
+  try {
+    const res = await pollWechatQrSession(targetQrcodeId);
+    if (qr.runId !== targetRunId || qr.qrcodeId !== targetQrcodeId) return;
+    qr.pollCount += 1;
+    const nextStatus = res?.status || 'unknown';
+    qr.status = nextStatus;
+    appendWechatQrTrail(nextStatus);
+    showNotice(`手动轮询结果：${nextStatus}`, 'info');
+  } catch (err) {
+    if (qr.runId !== targetRunId || qr.qrcodeId !== targetQrcodeId) return;
+    qr.pollCount += 1;
+    const label = err instanceof ApiError ? `${err.status}(${err.code})` : 'network_error';
+    appendWechatQrTrail(label);
+    showNotice(`手动轮询返回异常：${formatApiError(err, '未知错误')}`, 'warn');
+  } finally {
+    if (qr.runId === targetRunId && qr.qrcodeId === targetQrcodeId) {
+      qr.manualPolling = false;
+      renderWechatQr();
+    }
+  }
+}
+
+function switchAuthTab(nextTab) {
+  const prevTab = state.authTab;
+  state.authTab = nextTab;
+  el.authErrorText?.classList.add('hidden');
+
+  if (nextTab !== 'wechat') {
+    const wasActive = state.wechatQr.polling || state.wechatQr.loading;
+    if (prevTab === 'wechat' || wasActive) {
+      stopWechatQrPolling(
+        wasActive
+          ? { status: 'stopped', message: '已切换登录方式，停止微信扫码轮询。' }
+          : {},
+      );
+    }
+    renderAuth();
+    return undefined;
+  }
+
+  renderAuth();
+  if (!state.me && !isWechatQrSessionActive()) {
+    return startWechatQrLogin();
+  }
+  return undefined;
+}
+
 function renderAuth() {
   const signedIn = Boolean(state.me);
   el.authBadge.textContent = signedIn ? '已登录' : '未登录';
@@ -428,16 +1193,23 @@ function renderAuth() {
     el.authSessionLabel.textContent = state.me.sessionId;
   }
 
+  const isSignIn = state.authTab === 'signin';
   const isSignUp = state.authTab === 'signup';
-  el.tabSignInBtn.classList.toggle('active', !isSignUp);
+  const isWechat = state.authTab === 'wechat';
+  el.tabSignInBtn.classList.toggle('active', isSignIn);
   el.tabSignUpBtn.classList.toggle('active', isSignUp);
-  el.tabSignInBtn.setAttribute('aria-selected', String(!isSignUp));
+  el.tabWechatQrBtn?.classList.toggle('active', isWechat);
+  el.tabSignInBtn.setAttribute('aria-selected', String(isSignIn));
   el.tabSignUpBtn.setAttribute('aria-selected', String(isSignUp));
+  el.tabWechatQrBtn?.setAttribute('aria-selected', String(isWechat));
+  el.authForm.classList.toggle('hidden', isWechat);
+  el.wechatQrPanel?.classList.toggle('hidden', !isWechat);
   el.authNameField.classList.toggle('hidden', !isSignUp);
   el.authPasswordInput.setAttribute('autocomplete', isSignUp ? 'new-password' : 'current-password');
   el.authSubmitBtn.textContent = isSignUp ? '注册并登录' : '登录';
 
   renderConfig();
+  renderWechatQr();
 }
 
 function renderModels() {
@@ -1400,6 +2172,9 @@ async function refreshAuthAndData() {
     state.me = null;
     state.sessionUser = null;
   }
+  if (state.me && (state.wechatQr.polling || state.wechatQr.loading)) {
+    stopWechatQrPolling();
+  }
   renderAuth();
   await refreshProviderAndModels();
   await refreshConversations(true);
@@ -1432,8 +2207,12 @@ function renderProviderModalSummary() {
 }
 
 function bindEvents() {
+  if (eventsBound) return;
+  eventsBound = true;
+
   const switchMode = async (mode, message) => {
     try {
+      stopWechatQrPolling({ resetDiag: true });
       state.config = await setDemoMode(mode);
       closeConversationResources();
       state.activeConversationId = null;
@@ -1457,21 +2236,20 @@ function bindEvents() {
     void refreshConfig();
   });
 
-  el.tabSignInBtn.addEventListener('click', () => {
-    state.authTab = 'signin';
-    el.authErrorText.classList.add('hidden');
-    renderAuth();
-  });
+  if (typeof window !== 'undefined' && typeof window.addEventListener === 'function') {
+    window.addEventListener('message', handleWechatQrWindowMessage);
+  }
 
-  el.tabSignUpBtn.addEventListener('click', () => {
-    state.authTab = 'signup';
-    el.authErrorText.classList.add('hidden');
-    renderAuth();
-  });
+  el.tabSignInBtn.addEventListener('click', () => switchAuthTab('signin'));
+
+  el.tabSignUpBtn.addEventListener('click', () => switchAuthTab('signup'));
+
+  el.tabWechatQrBtn?.addEventListener('click', () => switchAuthTab('wechat'));
 
   el.sandboxQuickLoginBtn.addEventListener('click', async () => {
     const acc = state.config?.sandboxAccount;
     if (!acc) return;
+    stopWechatQrPolling();
     el.authErrorText.classList.add('hidden');
     el.sandboxQuickLoginBtn.disabled = true;
     try {
@@ -1486,8 +2264,36 @@ function bindEvents() {
     }
   });
 
+  el.wechatQrRefreshBtn?.addEventListener('click', (e) => {
+    e?.stopPropagation?.();
+    return startWechatQrLogin();
+  });
+
+  el.wechatQrViewport?.addEventListener('click', (e) => {
+    if (e?.target === el.wechatQrRefreshBtn) return undefined;
+    if (isWechatQrRefreshable()) {
+      return startWechatQrLogin();
+    }
+    return undefined;
+  });
+
+  el.wechatQrCancelBtn?.addEventListener('click', () => {
+    if (state.wechatQr.loading || state.wechatQr.polling) {
+      appendWechatQrTrail('stopped');
+      stopWechatQrPolling({
+        status: 'stopped',
+        message: '已手动停止轮询，点击上方二维码区域可重新加载。',
+      });
+      return undefined;
+    }
+    return startWechatQrLogin();
+  });
+
+  el.wechatQrManualPollBtn?.addEventListener('click', () => manualPollWechatQr());
+
   el.authForm.addEventListener('submit', async (e) => {
     e.preventDefault();
+    stopWechatQrPolling();
     el.authErrorText.classList.add('hidden');
     const email = el.authEmailInput.value.trim();
     const password = el.authPasswordInput.value;
@@ -1511,6 +2317,7 @@ function bindEvents() {
   });
 
   el.signOutBtn.addEventListener('click', async () => {
+    stopWechatQrPolling();
     try {
       await signOut();
     } catch {}
@@ -1796,18 +2603,30 @@ if (typeof document !== 'undefined' && !globalThis.__MIO_DEMO_SKIP_BOOT__) {
 
 export {
   attachDerivedAssetForFollowUp,
+  bindEvents,
   buildFollowUpPrompt,
   buildToolCardElement,
   clearAttachmentsAndAssetCache,
+  clearWechatQrEmbedContainer,
   closeConversationResources,
   collectMergedToolMap,
   connectConversationSse,
   el,
   extractJobAssetIds,
   findLatestCompletedImageInConversation,
+  fitWechatQrIframe,
+  handleWechatQrWindowMessage,
+  loadWxLoginScript,
+  manualPollWechatQr,
   mergeJobView,
+  parseWechatAuthorizationUrl,
   registerToolJob,
+  renderAuth,
   renderTimeline,
+  renderWechatQr,
   resolveMergedToolName,
+  startWechatQrLogin,
   state,
+  stopWechatQrPolling,
+  switchAuthTab,
 };
